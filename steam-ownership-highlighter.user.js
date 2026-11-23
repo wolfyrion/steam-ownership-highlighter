@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Ownership Highlighter - Stable
 // @namespace    https://github.com/steam-ownership-highlighter
-// @version      5.7.3
+// @version      5.8.2
 // @description  Steam ownership and wishlist badges (including name matching on Humble, Fanatical, IndieGala and Green Man Gaming), resilient refresh, safe owned-row filtering, and Steam/ITAD hover prices.
 // @author       Wolfyrion + ChatGPT
 // @homepageURL  https://github.com/wolfyrion/steam-ownership-highlighter
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '5.7.3';
+  const VERSION = '5.8.2';
   const USERDATA_URL = 'https://store.steampowered.com/dynamicstore/userdata/';
   const CACHE_KEY = 'steam_highlighter_stable_userdata_v1';
   const SETTINGS_KEY = 'steam_highlighter_stable_settings_v1';
@@ -65,10 +65,18 @@
 
   const SITES = {
     'www.humblebundle.com': {
-      titles: ['.item-title', '.product-title', '.entity-title', '.human_name-view'],
+      // 2026 Next.js pages: bundle cards carry data-testid hooks; class names are Tailwind.
+      titles: ['[data-testid="bundle-item-card"] .line-clamp-2', '[data-testid*="card" i] .line-clamp-2',
+        '.item-title', '.product-title', '.entity-title', '.human_name-view'],
       jsonScripts: 'script#webpack-bundle-page-data, script#webpack-json-data, ' +
         'script#storefront-webpack-json-data, script[type="application/json"]',
-      jsonNameKey: 'human_name'
+      jsonNameKey: 'human_name',
+      nextFlight: true,            // game lists live in the Next.js RSC stream (self.__next_f)
+      altTitles: true,             // cover art carries the game name (only names from page data count)
+      cornerFor: '.line-clamp-2',  // clamped titles would clip an inline link: use the corner chip
+      textSkip: 'p,em,strong',     // don't badge game names mentioned inside promo text
+      watchText: 'h3',             // the Membership detail panel swaps its title text in place
+      slides: '[aria-roledescription="slide"][data-media-index]' // Membership carousel
     },
     'www.fanatical.com': {
       titles: ['.bundle-product-card__title', '.card-product-name', '.product-name', '.hitCardStripe__seoName'],
@@ -116,7 +124,8 @@
   const ROW_SELECTOR = [
     '.giveaway__row-outer-wrap', '.table__row-outer-wrap',
     '.thing', 'shreddit-post', 'tr', 'li',
-    '.tier-item-view' // Humble Bundle tiles
+    '.tier-item-view', // Humble Bundle tiles (old layout)
+    '[data-testid="bundle-item-card"]' // Humble Bundle cards (2026 layout)
   ].join(',');
   const UI_SELECTOR = '#sg-panel,#sg-mini,#sg-tip,#sg-toast,#sg-pick';
   const LINK_SELECTOR = [
@@ -1292,6 +1301,10 @@
           if (mutation.target.tagName === 'A' && markLink(mutation.target)) relevant = true;
           continue;
         }
+        if (mutation.type === 'characterData') {
+          if (SITE?.watchText && parent?.matches(SITE.watchText)) relevant = true;
+          continue;
+        }
         for (const node of mutation.addedNodes) {
           if (node.nodeType !== 1 || node.matches(UI_SELECTOR)) continue;
           pendingRoots.add(node);
@@ -1320,7 +1333,8 @@
     });
 
     observer.observe(document.body, {
-      childList: true, subtree: true, attributes: true, attributeFilter: ['href']
+      childList: true, subtree: true, attributes: true, attributeFilter: ['href'],
+      characterData: !!SITE?.watchText
     });
   }
 
@@ -1390,7 +1404,7 @@
   }
 
   function baseName(normalized) {
-    return normalized.replace(EDITION_RE, '').trim();
+    return normalized.replace(/\s+dlc$/, '').replace(EDITION_RE, '').trim();
   }
 
   function looksLikeTitle(text) {
@@ -1501,6 +1515,115 @@
     }
   }
 
+  // Humble (2026) is a Next.js site: product data is streamed in
+  // <script>self.__next_f.push([1,"..."])</script> chunks. Join the chunks and
+  // pull the product lists out by key. Only Steam-delivered items are used.
+  let flightScripts = -1;
+  let slideNames = [];
+
+  function jsonValueAt(text, start) {
+    const open = text[start];
+    if (open !== '[' && open !== '{') return undefined;
+    let depth = 0;
+    let inString = false;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i];
+      if (inString) {
+        if (c === '\\') i++;
+        else if (c === '"') inString = false;
+      } else if (c === '"') inString = true;
+      else if (c === '[' || c === '{') depth++;
+      else if (c === ']' || c === '}') {
+        if (--depth === 0) {
+          try { return JSON.parse(text.slice(start, i + 1)); } catch (_) { return undefined; }
+        }
+      }
+    }
+    return undefined;
+  }
+
+  function flightValues(text, key) {
+    const values = [];
+    const needle = `"${key}":`;
+    for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + needle.length)) {
+      const value = jsonValueAt(text, at + needle.length);
+      if (value !== undefined) values.push(value);
+    }
+    return values;
+  }
+
+  function steamDelivered(item) {
+    return !Array.isArray(item?.deliveryMethods) || item.deliveryMethods.some(m => /steam/i.test(String(m)));
+  }
+
+  function addProducts(list) {
+    let added = 0;
+    if (!Array.isArray(list)) return added;
+    for (const item of list) {
+      if (!item || typeof item.title !== 'string' || !steamDelivered(item)) continue;
+      if (addName(item.title, steamIdIn(item))) added++;
+    }
+    return added;
+  }
+
+  function addSteamProducts(root) {
+    const stack = [[root, 0]];
+    let visited = 0;
+    while (stack.length && visited++ < 50000) {
+      const [node, depth] = stack.pop();
+      if (!node || typeof node !== 'object' || depth > 25) continue;
+      if (!Array.isArray(node) && typeof node.title === 'string' && Array.isArray(node.deliveryMethods) &&
+          node.deliveryMethods.some(m => /steam/i.test(String(m)))) {
+        addName(node.title, steamIdIn(node));
+      }
+      for (const value of Object.values(node)) {
+        if (value && typeof value === 'object') stack.push([value, depth + 1]);
+      }
+    }
+  }
+
+  function readNextFlight() {
+    if (!SITE?.nextFlight) return;
+    const scripts = [...document.querySelectorAll('script:not([src])')]
+      .filter(script => script.textContent.trimStart().startsWith('self.__next_f.push('));
+    if (scripts.length === flightScripts) return;
+    flightScripts = scripts.length;
+
+    let text = '';
+    for (const script of scripts) {
+      const m = /^\s*self\.__next_f\.push\(([\s\S]*)\)\s*;?\s*$/.exec(script.textContent);
+      if (!m) continue;
+      try {
+        const chunk = JSON.parse(m[1]);
+        if (chunk[0] === 1 && typeof chunk[1] === 'string') text += chunk[1];
+      } catch (_) {}
+    }
+    if (!text) return;
+
+    // Bundle pages: bundlePage.tiers[].bundleItems[]
+    for (const page of flightValues(text, 'bundlePage')) {
+      for (const tier of Array.isArray(page?.tiers) ? page.tiers : []) addProducts(tier?.bundleItems);
+    }
+    // Membership: this month's games
+    const products = flightValues(text, 'subscriptionProducts').find(Array.isArray) || [];
+    addProducts(products);
+
+    // Any other page (Membership home, store pages...): every product object
+    // in the stream with a title and Steam delivery, whatever key holds it.
+    for (const line of text.split('\n')) {
+      const colon = line.indexOf(':');
+      if (colon < 1 || !line.includes('"deliveryMethods"')) continue;
+      let json;
+      try { json = JSON.parse(line.slice(colon + 1)); } catch (_) { continue; }
+      addSteamProducts(json);
+    }
+
+    // Carousel slides show only artwork; map each slide index to a game name.
+    const media = (flightValues(text, 'mediaItems').find(Array.isArray) || [])
+      .map(item => (typeof item?.title === 'string' ? item.title : ''));
+    slideNames = media.some(Boolean) ? media : products.map(item => item?.title || '');
+  }
+
   // Fanatical is a single-page app; its public product API includes the
   // bundle's games, often with their Steam IDs. Failures are silent: the
   // title selectors still work without it.
@@ -1532,7 +1655,7 @@
   // so try a few spellings. These only change what is searched for; a result
   // must still match the site's name exactly (ignoring edition suffixes).
   function nameQueries(name) {
-    const clean = String(name).replace(/[™®©]/g, '').replace(/\s+/g, ' ').trim();
+    const clean = String(name).replace(/[™®©]/g, '').replace(/\s*\(dlc\)\s*$/i, '').replace(/\s+/g, ' ').trim();
     const variants = [
       clean,
       clean.replace(/\s*[:\-–—]+\s*/g, ' ').trim(),
@@ -1767,25 +1890,43 @@
     if (miss && nameIndex.get(key)?.appid) return false;
     if (el.tagName !== 'IMG') {
       if (!el.nextElementSibling?.classList.contains('sg-humble-row')) return false;
-      if (!miss && !el.querySelector(':scope > a.sg-humble-link')) return false;
+      if (!miss && !cornerOnly(el) && !el.querySelector(':scope > a.sg-humble-link')) return false;
     }
     if (el.dataset.sgHumbleCorner && !titleCorner.get(el)?.isConnected) return false;
     return true;
   }
 
+  // Titles cut off with an ellipsis or line clamp would hide an inline link,
+  // so those get the corner chip instead.
+  function clipped(el) {
+    const style = getComputedStyle(el);
+    if (style.textOverflow === 'ellipsis') return true;
+    const clamp = style.webkitLineClamp || style.getPropertyValue('-webkit-line-clamp');
+    return !!clamp && clamp !== 'none';
+  }
+
+  function cornerOnly(el) {
+    if (!SITE?.cornerFor) return false;
+    return el.matches(SITE.cornerFor) || clipped(el);
+  }
+
   function applyNameResult(el, key, appid) {
     const name = nameIndex.get(key)?.name || key;
     const isImage = el.tagName === 'IMG';
+    const corner = cornerOnly(el);
     if (appid) {
       nameUnmatched.delete(name);
       delete el.dataset.sgHumbleMiss;
-      if (!isImage) { injectNameLink(el, appid); injectNameRow(el, key, appid); }
+      if (!isImage) {
+        if (!corner) injectNameLink(el, appid);
+        injectNameRow(el, key, appid);
+      }
     } else {
       el.dataset.sgHumbleMiss = '1';
       nameUnmatched.add(name);
       if (!isImage) injectNameRow(el, key, null);
     }
-    if (isImage || SITE?.cornerBadge || !isShown(el)) injectCorner(el, key, appid);
+    if (isImage || corner || SITE?.cornerBadge || !isShown(el)) injectCorner(el, key, appid);
     el.dataset.sgHumbleDone = '1';
     scheduleUpdate();
   }
@@ -1793,6 +1934,7 @@
   function nameScan() {
     if (!settings.enabled || !document.body || pickerActive || !nameScanEnabled()) return;
     readPageJson();
+    readNextFlight();
     loadSiteApi();
 
     const targets = new Map(); // element -> normalized name
@@ -1819,6 +1961,7 @@
         if (!key || !nameIndex.has(key)) continue;
         const el = node.parentElement;
         if (!el || targets.has(el) || el.closest(skip)) continue;
+        if (SITE?.textSkip && el.closest(SITE.textSkip)) continue;
         targets.set(el, key);
       }
     }
@@ -1830,6 +1973,17 @@
         if (targets.has(img) || img.closest(skip)) continue;
         const key = normName(img.alt);
         if (key && nameIndex.has(key)) targets.set(img, key);
+      }
+    }
+
+    // Carousel slides (Humble Membership): badge the slide artwork by its index.
+    if (SITE?.slides && slideNames.length) {
+      for (const slide of document.querySelectorAll(SITE.slides)) {
+        const img = slide.querySelector('img');
+        const name = slideNames[Number(slide.dataset.mediaIndex)];
+        const key = name ? normName(name) : '';
+        if (!img || !key || !nameIndex.has(key) || targets.has(img) || img.closest(skip)) continue;
+        targets.set(img, key);
       }
     }
 
