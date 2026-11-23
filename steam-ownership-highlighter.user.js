@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Ownership Highlighter - Stable
 // @namespace    https://github.com/steam-ownership-highlighter
-// @version      5.8.1
+// @version      5.8.2
 // @description  Steam ownership and wishlist badges (including name matching on Humble, Fanatical, IndieGala and Green Man Gaming), resilient refresh, safe owned-row filtering, and Steam/ITAD hover prices.
 // @author       Wolfyrion + ChatGPT
 // @homepageURL  https://github.com/wolfyrion/steam-ownership-highlighter
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '5.8.1';
+  const VERSION = '5.8.2';
   const USERDATA_URL = 'https://store.steampowered.com/dynamicstore/userdata/';
   const CACHE_KEY = 'steam_highlighter_stable_userdata_v1';
   const SETTINGS_KEY = 'steam_highlighter_stable_settings_v1';
@@ -1896,8 +1896,18 @@
     return true;
   }
 
+  // Titles cut off with an ellipsis or line clamp would hide an inline link,
+  // so those get the corner chip instead.
+  function clipped(el) {
+    const style = getComputedStyle(el);
+    if (style.textOverflow === 'ellipsis') return true;
+    const clamp = style.webkitLineClamp || style.getPropertyValue('-webkit-line-clamp');
+    return !!clamp && clamp !== 'none';
+  }
+
   function cornerOnly(el) {
-    return !!SITE?.cornerFor && el.matches(SITE.cornerFor);
+    if (!SITE?.cornerFor) return false;
+    return el.matches(SITE.cornerFor) || clipped(el);
   }
 
   function applyNameResult(el, key, appid) {
