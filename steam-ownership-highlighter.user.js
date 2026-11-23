@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Ownership Highlighter - Stable
 // @namespace    https://github.com/steam-ownership-highlighter
-// @version      5.8.2
+// @version      5.8.3
 // @description  Steam ownership and wishlist badges (including name matching on Humble, Fanatical, IndieGala and Green Man Gaming), resilient refresh, safe owned-row filtering, and Steam/ITAD hover prices.
 // @author       Wolfyrion + ChatGPT
 // @homepageURL  https://github.com/wolfyrion/steam-ownership-highlighter
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '5.8.2';
+  const VERSION = '5.8.3';
   const USERDATA_URL = 'https://store.steampowered.com/dynamicstore/userdata/';
   const CACHE_KEY = 'steam_highlighter_stable_userdata_v1';
   const SETTINGS_KEY = 'steam_highlighter_stable_settings_v1';
@@ -516,6 +516,7 @@
       white-space:nowrap !important;
     }
     a.sg-corner-miss { opacity:.85; }
+    a.sg-corner-nonsteam { opacity:.9; cursor:default !important; color:#adbac7 !important; }
     body:not(.sg-enabled) a.sg-corner { display:none !important; }
     #sg-pick {
       position:fixed; z-index:2147483646; pointer-events:none; box-sizing:border-box;
@@ -1381,6 +1382,7 @@
   const nameIndex = new Map();      // normalized name -> { name, appid }
   const namePending = new Map();    // normalized name -> Promise<appid|null|undefined>
   const nameUnmatched = new Set();
+  const nonSteamNames = new Map(); // normalized name -> name, for items the site delivers outside Steam
   const apiRequested = new Set();
   let nameMatches = null;
   let nameSaveTimer = null;
@@ -1556,11 +1558,22 @@
     return !Array.isArray(item?.deliveryMethods) || item.deliveryMethods.some(m => /steam/i.test(String(m)));
   }
 
+  function noteNonSteam(name) {
+    const key = normName(name);
+    if (key && looksLikeTitle(String(name).trim())) nonSteamNames.set(key, String(name).trim());
+  }
+
+  // Non-Steam only when the site's data never lists it as delivered on Steam.
+  function isNonSteam(key) {
+    return nonSteamNames.has(key) && !nameIndex.has(key);
+  }
+
   function addProducts(list) {
     let added = 0;
     if (!Array.isArray(list)) return added;
     for (const item of list) {
-      if (!item || typeof item.title !== 'string' || !steamDelivered(item)) continue;
+      if (!item || typeof item.title !== 'string') continue;
+      if (!steamDelivered(item)) { noteNonSteam(item.title); continue; }
       if (addName(item.title, steamIdIn(item))) added++;
     }
     return added;
@@ -1573,8 +1586,9 @@
       const [node, depth] = stack.pop();
       if (!node || typeof node !== 'object' || depth > 25) continue;
       if (!Array.isArray(node) && typeof node.title === 'string' && Array.isArray(node.deliveryMethods) &&
-          node.deliveryMethods.some(m => /steam/i.test(String(m)))) {
-        addName(node.title, steamIdIn(node));
+          node.deliveryMethods.length) {
+        if (steamDelivered(node)) addName(node.title, steamIdIn(node));
+        else noteNonSteam(node.title);
       }
       for (const value of Object.values(node)) {
         if (value && typeof value === 'object') stack.push([value, depth + 1]);
@@ -1858,9 +1872,13 @@
       if (getComputedStyle(tile).position === 'static') tile.style.position = 'relative';
       tile.appendChild(chip);
     }
+    chip.classList.remove('sg-corner-nonsteam');
+    chip.target = '_blank';
+    chip.rel = 'noopener noreferrer';
     linkTitle.set(chip, el);
     titleCorner.set(el, chip);
     el.dataset.sgHumbleCorner = '1';
+    delete el.dataset.sgHumbleNonSteam;
 
     if (appid) {
       chip.classList.add('sg-humble-link');
@@ -1931,6 +1949,35 @@
     scheduleUpdate();
   }
 
+  // A grey "Non-Steam" corner tag for items the site delivers elsewhere
+  // (Battle.net, EA app, subscriptions...). No Steam search is made for them.
+  function markNonSteam(el, key) {
+    if (el.dataset.sgHumble === key && el.dataset.sgHumbleNonSteam && titleCorner.get(el)?.isConnected) return;
+    el.dataset.sgHumble = key;
+    el.dataset.sgHumbleNonSteam = '1';
+    el.dataset.sgHumbleDone = '1';
+    const tile = nameTileOf(el);
+    if (!tile) return;
+    let chip = tile.querySelector(':scope > a.sg-corner');
+    if (!chip) {
+      chip = document.createElement('a');
+      chip.className = 'sg-corner';
+      chip.addEventListener('click', event => { if (!chip.href) { event.preventDefault(); event.stopPropagation(); } });
+      if (getComputedStyle(tile).position === 'static') tile.style.position = 'relative';
+      tile.appendChild(chip);
+    }
+    if (chip.dataset.sgKey) unmarkLink(chip);
+    chip.classList.remove('sg-humble-link', 'sg-corner-miss');
+    chip.classList.add('sg-corner-nonsteam');
+    chip.removeAttribute('href');
+    chip.removeAttribute('target');
+    chip.textContent = 'Non-Steam';
+    chip.title = 'Not delivered on Steam';
+    linkTitle.set(chip, el);
+    titleCorner.set(el, chip);
+    el.dataset.sgHumbleCorner = '1';
+  }
+
   function nameScan() {
     if (!settings.enabled || !document.body || pickerActive || !nameScanEnabled()) return;
     readPageJson();
@@ -1947,8 +1994,9 @@
         if (targets.has(el) || el.closest(skip)) continue;
         const text = ownText(el);
         if (!looksLikeTitle(text)) continue;
-        addName(text, null);
-        targets.set(el, normName(text));
+        const textKey = normName(text);
+        if (!isNonSteam(textKey)) addName(text, null);
+        targets.set(el, textKey);
       }
     }
 
@@ -1958,7 +2006,7 @@
         const text = node.nodeValue;
         if (!text || text.length > 150) continue;
         const key = normName(text);
-        if (!key || !nameIndex.has(key)) continue;
+        if (!key || (!nameIndex.has(key) && !isNonSteam(key))) continue;
         const el = node.parentElement;
         if (!el || targets.has(el) || el.closest(skip)) continue;
         if (SITE?.textSkip && el.closest(SITE.textSkip)) continue;
@@ -1972,7 +2020,7 @@
       for (const img of document.querySelectorAll('img[alt]')) {
         if (targets.has(img) || img.closest(skip)) continue;
         const key = normName(img.alt);
-        if (key && nameIndex.has(key)) targets.set(img, key);
+        if (key && (nameIndex.has(key) || isNonSteam(key))) targets.set(img, key);
       }
     }
 
@@ -1982,12 +2030,13 @@
         const img = slide.querySelector('img');
         const name = slideNames[Number(slide.dataset.mediaIndex)];
         const key = name ? normName(name) : '';
-        if (!img || !key || !nameIndex.has(key) || targets.has(img) || img.closest(skip)) continue;
+        if (!img || !key || (!nameIndex.has(key) && !isNonSteam(key)) || targets.has(img) || img.closest(skip)) continue;
         targets.set(img, key);
       }
     }
 
     for (const [el, key] of targets) {
+      if (isNonSteam(key)) { markNonSteam(el, key); continue; }
       if (nameHandled(el, key)) continue;
       if (el.dataset.sgHumble !== key && nearNativeLink(el)) continue;
       el.dataset.sgHumble = key;
@@ -2196,7 +2245,7 @@
       node.remove();
     });
     document.querySelectorAll('[data-sg-humble]').forEach(el => {
-      for (const flag of ['sgHumble', 'sgHumbleMiss', 'sgHumbleDone', 'sgHumbleCorner']) delete el.dataset[flag];
+      for (const flag of ['sgHumble', 'sgHumbleMiss', 'sgHumbleDone', 'sgHumbleCorner', 'sgHumbleNonSteam']) delete el.dataset[flag];
     });
     nameUnmatched.clear();
     nameScan();
