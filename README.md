@@ -1,6 +1,6 @@
 # Steam Ownership Highlighter
 
-A Tampermonkey / Violentmonkey userscript. It adds Steam ownership and wishlist badges on SteamGifts, r/GameDeals, r/FreeGameFindings, GG.deals, IsThereAnyDeal, Humble Bundle, Fanatical, IndieGala and Green Man Gaming. On stores that don't show Steam app IDs, it matches games by name. Hover a game to see Steam and ITAD prices. It can also filter out rows for games you already own.
+A Tampermonkey / Violentmonkey userscript. It adds Steam ownership and wishlist badges on SteamGifts, r/GameDeals, r/FreeGameFindings, GG.deals, IsThereAnyDeal, Humble Bundle, Fanatical, IndieGala, Green Man Gaming, Loaded (ex-CDKeys), Gamesplanet and Barter.vg. On stores that don't show Steam app IDs, it matches games by name. Hover a game to see Steam and ITAD prices. It can also filter out rows for games you already own.
 
 ## Installation
 

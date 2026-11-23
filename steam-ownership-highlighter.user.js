@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Steam Ownership Highlighter - Stable
 // @namespace    https://github.com/steam-ownership-highlighter
-// @version      5.8.3
-// @description  Steam ownership and wishlist badges (including name matching on Humble, Fanatical, IndieGala and Green Man Gaming), resilient refresh, safe owned-row filtering, and Steam/ITAD hover prices.
+// @version      5.9.0
+// @description  Steam ownership and wishlist badges (including name matching on Humble, Fanatical, IndieGala, Green Man Gaming, Loaded, Gamesplanet and Barter.vg), resilient refresh, safe owned-row filtering, and Steam/ITAD hover prices.
 // @author       Wolfyrion + ChatGPT
 // @homepageURL  https://github.com/wolfyrion/steam-ownership-highlighter
 // @supportURL   https://github.com/wolfyrion/steam-ownership-highlighter/issues
@@ -19,6 +19,9 @@
 // @match        https://www.humblebundle.com/*
 // @match        https://www.fanatical.com/*
 // @match        https://www.greenmangaming.com/*
+// @match        https://barter.vg/*
+// @match        https://www.loaded.com/*
+// @match        https://*.gamesplanet.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -35,7 +38,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '5.8.3';
+  const VERSION = '5.9.0';
   const USERDATA_URL = 'https://store.steampowered.com/dynamicstore/userdata/';
   const CACHE_KEY = 'steam_highlighter_stable_userdata_v1';
   const SETTINGS_KEY = 'steam_highlighter_stable_settings_v1';
@@ -87,11 +90,37 @@
     'www.indiegala.com': {
       titles: ['.bundle-page-tier-item-title', '.bundle-page-tier-item-name', '.store-product-header-title']
     },
+    'barter.vg': {
+      // Game pages carry real Steam store links (badged as usual); lists only link to /i/ID/.
+      titles: ['table a[href*="barter.vg/i/"]', 'table a[href^="/i/"]']
+    },
+    'www.loaded.com': {
+      titles: ['a.product-item-link', '.product-title h1'],
+      cleanTitle: storeTitle,
+      // Listing tiles show DRM icons (img.icon alt="steam"); product URLs end in -steam.
+      isSteam: el => {
+        const tile = el.closest('form.product-item, .product-item');
+        const icons = tile ? [...tile.querySelectorAll('img.icon[alt]')] : [];
+        if (icons.length) return icons.some(img => /steam/i.test(img.alt));
+        if (!tile && /-steam(?:[/?#]|$)/i.test(location.pathname)) return true;
+        return null;
+      }
+    },
+    'gamesplanet.com': { // www/uk/us/de/fr subdomains
+      titles: ['.card h4 > a[href*="/game/"]', 'h1 > span.prod-title'],
+      cleanTitle: storeTitle,
+      isSteam: el => {
+        const href = el.tagName === 'A' ? el.getAttribute('href') || '' : location.pathname;
+        if (!/\/game\//.test(href)) return null;
+        return /-steam-key--/i.test(href);
+      }
+    },
     'www.greenmangaming.com': {
       titles: ['.bundle-game-title', '.bundle-item .prod-name', '.prod-name', '.product-title']
     }
   };
-  const SITE = SITES[location.hostname] || null;
+  const SITE = SITES[location.hostname] ||
+    Object.entries(SITES).find(([host]) => location.hostname.endsWith('.' + host))?.[1] || null;
 
   const STEAM_HOSTS = new Set(['store.steampowered.com', 'steamdb.info', 'steamcommunity.com']);
   const STATUSES = ['owned', 'wishlist', 'followed', 'ignored', 'missing', 'unknown'];
@@ -165,6 +194,20 @@
   /* ---------------------------------------------------------------- *
    * Settings and cache
    * ---------------------------------------------------------------- */
+
+  // Key shops add platform, launcher and region text to titles:
+  // "Red Dead Redemption 2 PC - Rockstar Games Launcher", "Marathon PC Key",
+  // "Minecraft: Java & Bedrock Edition PC (Europe & UK)", "HELLDIVERS 2 Steam Key".
+  function storeTitle(text) {
+    return String(text)
+      .replace(/\s*\((?:GOG|Steam|EU|UK|US|WW|ROW|Global|Worldwide|Europe[^)]*|[^)]*Region[^)]*)\)/gi, '')
+      .replace(/\s+[-–]\s+(?:Rockstar Games Launcher|Rockstar|EA App|Origin|Ubisoft Connect|Uplay|Epic Games(?: Store)?|Battle\.net|Microsoft Store|Xbox[^-]*|Steam)$/i, '')
+      .replace(/\s+(?:PC|Mac|PC\s*\/\s*Mac)(?:\s+(?:Steam\s+)?(?:CD\s+)?Key)?$/i, '')
+      .replace(/\s+Steam(?:\s+(?:CD\s+)?Key)?$/i, '')
+      .replace(/\s+(?:CD\s+)?Key$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
 
   function normalizeSettings(value) {
     const result = { ...DEFAULTS, ...(value && typeof value === 'object' ? value : {}) };
@@ -1383,6 +1426,7 @@
   const namePending = new Map();    // normalized name -> Promise<appid|null|undefined>
   const nameUnmatched = new Set();
   const nonSteamNames = new Map(); // normalized name -> name, for items the site delivers outside Steam
+  const nonSteamEls = new WeakSet(); // title elements the site marks as non-Steam (DRM icon, URL)
   const apiRequested = new Set();
   let nameMatches = null;
   let nameSaveTimer = null;
@@ -1778,9 +1822,14 @@
     return false;
   }
 
+  // Titles that are themselves links get the Steam link next to them
+  // (links can't nest), and no extra row.
   function injectNameLink(el, appid) {
     const href = `https://store.steampowered.com/app/${appid}/`;
-    let link = el.querySelector(':scope > a.sg-humble-link');
+    const isLink = el.tagName === 'A';
+    let link = isLink
+      ? (el.nextElementSibling?.matches('a.sg-humble-link') ? el.nextElementSibling : null)
+      : el.querySelector(':scope > a.sg-humble-link');
     if (!link) {
       link = document.createElement('a');
       link.className = 'sg-humble-link';
@@ -1789,8 +1838,9 @@
       link.textContent = 'Steam';
       // Tiles often open a popup or product page on click; keep our link separate.
       link.addEventListener('click', event => event.stopPropagation());
-      el.appendChild(link);
+      if (isLink) el.insertAdjacentElement('afterend', link); else el.appendChild(link);
     }
+    if (isLink) linkTitle.set(link, el); // so Hide Owned can find the tile
     if (link.getAttribute('href') !== href) link.href = href;
     if (markLink(link)) scheduleUpdate();
   }
@@ -1906,7 +1956,9 @@
     const miss = !!el.dataset.sgHumbleMiss;
     // A "no match" is redone if a Steam ID arrived later (e.g. from Fanatical's API).
     if (miss && nameIndex.get(key)?.appid) return false;
-    if (el.tagName !== 'IMG') {
+    if (el.tagName === 'A') {
+      if (!miss && !cornerOnly(el) && !el.nextElementSibling?.matches('a.sg-humble-link')) return false;
+    } else if (el.tagName !== 'IMG') {
       if (!el.nextElementSibling?.classList.contains('sg-humble-row')) return false;
       if (!miss && !cornerOnly(el) && !el.querySelector(':scope > a.sg-humble-link')) return false;
     }
@@ -1937,12 +1989,12 @@
       delete el.dataset.sgHumbleMiss;
       if (!isImage) {
         if (!corner) injectNameLink(el, appid);
-        injectNameRow(el, key, appid);
+        if (el.tagName !== 'A') injectNameRow(el, key, appid);
       }
     } else {
       el.dataset.sgHumbleMiss = '1';
       nameUnmatched.add(name);
-      if (!isImage) injectNameRow(el, key, null);
+      if (!isImage && el.tagName !== 'A') injectNameRow(el, key, null);
     }
     if (isImage || corner || SITE?.cornerBadge || !isShown(el)) injectCorner(el, key, appid);
     el.dataset.sgHumbleDone = '1';
@@ -1992,10 +2044,16 @@
       try { found = document.querySelectorAll(selector); } catch (_) { continue; } // bad learned selector
       for (const el of found) {
         if (targets.has(el) || el.closest(skip)) continue;
-        const text = ownText(el);
+        const text = SITE?.cleanTitle ? SITE.cleanTitle(ownText(el)) : ownText(el);
         if (!looksLikeTitle(text)) continue;
         const textKey = normName(text);
-        if (!isNonSteam(textKey)) addName(text, null);
+        if (!textKey) continue;
+        if (SITE?.isSteam && SITE.isSteam(el) === false) {
+          nonSteamEls.add(el);
+          if (!nonSteamNames.has(textKey)) nonSteamNames.set(textKey, text);
+        } else if (!isNonSteam(textKey)) {
+          addName(text, null);
+        }
         targets.set(el, textKey);
       }
     }
@@ -2036,7 +2094,7 @@
     }
 
     for (const [el, key] of targets) {
-      if (isNonSteam(key)) { markNonSteam(el, key); continue; }
+      if (nonSteamEls.has(el) || isNonSteam(key)) { markNonSteam(el, key); continue; }
       if (nameHandled(el, key)) continue;
       if (el.dataset.sgHumble !== key && nearNativeLink(el)) continue;
       el.dataset.sgHumble = key;
